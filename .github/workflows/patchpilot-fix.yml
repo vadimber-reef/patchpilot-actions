@@ -1,0 +1,132 @@
+name: PatchPilot fix (reusable)
+# Central, repo-agnostic PatchPilot fix run. Lives in a SEPARATE, PUBLIC repo,
+# NOT the private patchpilot backend — so target
+# repos across different orgs can call it. Target repos ship only a tiny
+# workflow_dispatch stub that `uses:` this file, so a new PatchPilot version is a
+# one-place edit here.
+
+on:
+  workflow_call:
+    inputs:
+      head_branch:
+        description: "PR head branch to check out and fix"
+        required: true
+        type: string
+      source_run_id:
+        description: "The failed CI run id — the run fetches its full failing log"
+        required: true
+        type: string
+      prompt_b64:
+        description: "Base64 of the agent prompt, built by the backend"
+        required: true
+        type: string
+      prompt_degraded_b64:
+        description: "Base64 of the degraded-mode prompt (used when env prep fails), built by the backend"
+        required: true
+        type: string
+      claude_args:
+        description: "claude-code-action args (model + tool allowlist), built by the backend"
+        required: true
+        type: string
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: "Claude Code OAuth token. Passed explicitly by the caller — do NOT switch callers to secrets: inherit."
+        required: true
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read # read-only on purpose — a misbehaving run cannot write
+      actions: read
+      id-token: write
+    steps:
+      - name: Checkout the PR head branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.head_branch }}
+          fetch-depth: 0
+
+      - name: Collect the full failing CI log
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}         # implicit, scoped by the caller's permissions
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}    # bind inputs to env so the shell never re-parses them
+          REPO: ${{ github.repository }}                 # github context = the caller repo
+        run: |
+          gh run view "$SOURCE_RUN_ID" --log-failed \
+            --repo "$REPO" > failure_full.log || true
+          # Keep the FULL log; hand it to the agent as a file (no 128 KiB arg limit).
+          # Rely on GitHub's native secret masking (registered secrets are already ***).
+          sed -r 's/\x1b\[[0-9;]*m//g' failure_full.log > failure.log
+          rm -f failure_full.log
+          echo 'failure.log' >> .git/info/exclude  # the agent must not stage it
+
+      # The CALLER repo's own prepare action (resolved from the checked-out
+      # workspace), so the agent's env matches that repo's real CI. `services:
+      # true` brings up docker + runs migrations + exports service env.
+      #
+      # NON-FATAL on purpose: if the PR itself breaks prep (a bad migration, an
+      # unbootable service), we still want to run the agent — just in a degraded,
+      # reason-from-the-log mode (see the prompt step). continue-on-error keeps the
+      # job green; steps.prepare.outcome records whether it actually failed.
+      - name: Prepare environment
+        id: prepare
+        continue-on-error: true
+        uses: ./.github/actions/prepare
+        with:
+          services: "true"
+
+      # Decode the backend prompt. If prep failed, pick the backend's degraded-mode
+      # prompt (no live env → reason from the log) instead of the normal one. Both
+      # texts are backend-owned; the workflow only selects between them.
+      - name: Decode the backend-provided prompt
+        env:
+          PROMPT_B64: ${{ inputs.prompt_b64 }}
+          PROMPT_DEGRADED_B64: ${{ inputs.prompt_degraded_b64 }}
+          PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
+        shell: bash
+        run: |
+          if [ "$PREPARE_OUTCOME" = "failure" ]; then
+            SELECTED="$PROMPT_DEGRADED_B64"
+            echo "env prep failed — running the agent in degraded (reason-from-log) mode"
+          else
+            SELECTED="$PROMPT_B64"
+          fi
+          {
+            echo 'PROMPT<<PATCHPILOT_PROMPT_EOF'
+            printf '%s' "$SELECTED" | base64 -d
+            echo
+            echo 'PATCHPILOT_PROMPT_EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Run Claude in GATED mode (no push tools)
+        id: fix
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # PatchPilot's App dispatches the stub, so the triggering actor is a bot.
+          # Safe here: dispatch-only (only Django triggers) and gated (contents:read,
+          # no push tools). Tighten to the App's bot login if you prefer over "*".
+          allowed_bots: "*"
+          prompt: ${{ env.PROMPT }}
+          claude_args: ${{ inputs.claude_args }}
+
+      # upload the RAW transcript for the backend to parse. Fall back to an empty
+      # transcript so the backend always has a well-formed artifact (an empty
+      # event list parses to a safe can_fix:false result).
+      - name: Stage the raw execution transcript
+        if: always()
+        env:
+          EXEC_FILE: ${{ steps.fix.outputs.execution_file }}
+        run: |
+          FILE="${EXEC_FILE:-/home/runner/work/_temp/claude-execution-output.json}"
+          if [ -f "$FILE" ]; then cp "$FILE" transcript.json; else echo "[]" > transcript.json; fi
+
+      - name: Upload the transcript artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patchpilot-transcript
+          path: transcript.json
+          if-no-files-found: warn
