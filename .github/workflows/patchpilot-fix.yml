@@ -8,8 +8,8 @@ name: PatchPilot fix (reusable)
 on:
   workflow_call:
     inputs:
-      head_branch:
-        description: "PR head branch to check out and fix"
+      head_sha:
+        description: "Immutable PR head SHA from the failed CI run"
         required: true
         type: string
       source_run_id:
@@ -45,7 +45,7 @@ jobs:
       - name: Checkout the PR head branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ inputs.head_branch }}
+          ref: ${{ inputs.head_sha }}
           fetch-depth: 0
 
       - name: Collect the full failing CI log
